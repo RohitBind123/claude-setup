@@ -39,8 +39,12 @@ From inside the cloned repo:
 
 ```bash
 mkdir -p "$HOME/.claude"
-cp -R CLAUDE.md ECC-USAGE-GUIDE.md HOW-TO-START-ANY-PROJECT.md settings.json "$HOME/.claude/"
+# Config file + folders
+cp    CLAUDE.md settings.json "$HOME/.claude/"
 cp -R agents commands rules skills examples ecc-scripts "$HOME/.claude/"
+# Long-form guides live in docs/ in the repo, but land flat in ~/.claude/
+# so references like ~/.claude/ECC-USAGE-GUIDE.md keep working.
+cp docs/ECC-USAGE-GUIDE.md docs/HOW-TO-START-ANY-PROJECT.md "$HOME/.claude/"
 ```
 
 ### 3. Verify

@@ -161,8 +161,9 @@ Both stack. No manual setup per session.
 | `rules/` | Non-negotiable rules (perf, data quality, async safety, migration safety, security, testing, git) | Every session |
 | `examples/` | Template `CLAUDE.md` files for new projects | Copy per project |
 | `ecc-scripts/` | Node hook scripts referenced by `settings.json` | Every session |
-| `ECC-USAGE-GUIDE.md` | Full guide to the Everything Claude Code system | Read once |
-| `HOW-TO-START-ANY-PROJECT.md` | Playbook for starting a project the right way | Read once |
+| `docs/ECC-USAGE-GUIDE.md` | Full guide to the Everything Claude Code system | Read once |
+| `docs/HOW-TO-START-ANY-PROJECT.md` | Playbook for starting a project the right way | Read once |
+| `docs/INSTALL.md` | Detailed manual-install reference | When `install.sh` won't work |
 
 ---
 

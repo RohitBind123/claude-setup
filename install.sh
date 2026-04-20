@@ -30,11 +30,21 @@ fi
 
 # 3. Create target and copy files
 mkdir -p "$TARGET"
-for item in CLAUDE.md ECC-USAGE-GUIDE.md HOW-TO-START-ANY-PROJECT.md settings.json \
-            agents commands rules skills examples ecc-scripts; do
+
+# Config-level files at repo root go to ~/.claude/ root
+for item in CLAUDE.md settings.json agents commands rules skills examples ecc-scripts; do
   if [ -e "$SCRIPT_DIR/$item" ]; then
     cp -R "$SCRIPT_DIR/$item" "$TARGET/"
     ok "Installed $item"
+  fi
+done
+
+# Long-form guides live in docs/ in the repo but should land flat in ~/.claude/
+# so that global-scope references (e.g. ~/.claude/ECC-USAGE-GUIDE.md) keep working.
+for guide in ECC-USAGE-GUIDE.md HOW-TO-START-ANY-PROJECT.md; do
+  if [ -e "$SCRIPT_DIR/docs/$guide" ]; then
+    cp "$SCRIPT_DIR/docs/$guide" "$TARGET/"
+    ok "Installed $guide"
   fi
 done
 
