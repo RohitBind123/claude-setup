@@ -62,7 +62,36 @@ const pricingByTool = groupBy(rows, (r) => r.toolId);
 Detect N+1 early: log query counts per request and alert when a single
 request issues more than ~20 DB round-trips.
 
-## 3. Select Only What You Need
+## 3. Bulk Writes
+
+N individual INSERTs is the write-side of N+1 — one round-trip per row
+kills throughput on any non-trivial batch.
+
+```python
+# Python — SQLAlchemy multi-row insert
+await db.execute(insert(Tool), [row_dict_1, row_dict_2, ...])
+
+# Very large loads (100k+) — use Postgres COPY via asyncpg
+await conn.copy_records_to_table("tools", records=rows, columns=[...])
+```
+
+```typescript
+// Prisma
+await db.tool.createMany({ data: rows, skipDuplicates: true });
+// Drizzle
+await db.insert(tools).values(rows);
+```
+
+Rules:
+- Batches ≥ 50 rows → multi-row INSERT
+- Batches ≥ 10k rows → DB bulk-load path (`COPY` on Postgres,
+  `LOAD DATA` on MySQL)
+- Postgres caps at 65,535 bound parameters per statement — chunk
+  large batches accordingly
+- Upserts: use `INSERT ... ON CONFLICT DO UPDATE`, never SELECT-then-UPDATE
+  in a loop
+
+## 4. Select Only What You Need
 
 List endpoints should NOT load heavy columns (embeddings, full content,
 large JSONB). Name the columns you need explicitly.
@@ -78,7 +107,7 @@ large JSONB). Name the columns you need explicitly.
 Candidates to defer: embedding vectors (768/1536-dim), full-text bodies,
 large JSONB metadata, audit logs.
 
-## 4. Cache Stable Data
+## 5. Cache Stable Data
 
 Data that changes rarely must go through a cache (Redis, Memcached,
 CDN). Pick the TTL from the data's real update cadence, not a guess.
@@ -103,7 +132,7 @@ cache.set(key, serialize(result), ttl)
 return result
 ```
 
-## 5. HTTP Cache-Control Headers
+## 6. HTTP Cache-Control Headers
 
 Every endpoint should declare cacheability. The client and any
 intermediate CDN / proxy will respect it.
@@ -115,7 +144,7 @@ intermediate CDN / proxy will respect it.
 | User-specific (dashboard) | `private, no-cache` (use server-side cache instead) |
 | Real-time (feed) | `no-store` |
 
-## 6. Push Filtering to the Database
+## 7. Push Filtering to the Database
 
 NEVER load the full table and filter in application code. Push the
 predicate into SQL so the engine can use indexes.
@@ -136,10 +165,10 @@ For bulk updates: one `UPDATE ... WHERE ...` statement, never load-loop-save.
 > PostgreSQL JSONB / trigram / array operators catalogued in
 > `python/production-performance.md`.
 
-## 7. Fire-and-Forget for Non-Critical External Calls
+## 8. Fire-and-Forget for Non-Critical External Calls
 
-External API calls (analytics, third-party metadata, audit webhooks)
-that don't affect the response should not block it.
+Best-effort external calls (analytics pings, third-party metadata,
+audit webhooks) that don't affect the response should not block it.
 
 ```python
 # Python
@@ -161,10 +190,35 @@ void updateExternal(userId, payload).catch((err) =>
 return Response.json(result);
 ```
 
-Rule: anything the user doesn't see in the response, and that can fail
-without breaking the request, should be fire-and-forget.
+Rule: if the user doesn't see it in the response AND it's acceptable
+to lose on a restart, fire-and-forget. For must-succeed work, see §9.
 
-## 8. Set Timeouts Everywhere
+## 9. Background Jobs / Task Queues
+
+If work takes > 1 second OR must succeed with retries OR fans out to
+many recipients, push it off the request path onto a task queue.
+
+Offload by default:
+- Sending email / SMS / push notifications
+- Image / video / PDF processing
+- Fan-out webhooks (one event → many subscribers)
+- Report generation and data exports
+- Long-running AI work (batch embeddings, deep research)
+- Anything you'd retry on failure
+
+| Language | Queue |
+|---|---|
+| Python | Celery, RQ, Arq, Dramatiq |
+| Node | BullMQ, Agenda |
+| Ruby | Sidekiq |
+| Go | asynq, River |
+| Polyglot / durable | Temporal, Inngest, Trigger.dev |
+
+**Fire-and-forget vs job:** fire-and-forget is for best-effort
+(acceptable to lose on crash). Jobs are for must-succeed with retries,
+dead-letter queue, and visibility.
+
+## 10. Set Timeouts Everywhere
 
 A call without a timeout is a bug waiting for a slow day. Every
 boundary between your service and something else needs a deadline.
@@ -178,8 +232,8 @@ boundary between your service and something else needs a deadline.
 | External webhook | overall timeout | 5s (fire-and-forget) |
 | gRPC / long-poll | deadline on the call | per endpoint |
 
-In PostgreSQL, set a default statement timeout at the session level so
-runaway queries can't pin a connection:
+PostgreSQL session defaults that stop runaway queries from pinning a
+connection:
 
 ```sql
 ALTER ROLE app_user SET statement_timeout = '5s';
@@ -187,7 +241,37 @@ ALTER ROLE app_user SET lock_timeout = '3s';
 ALTER ROLE app_user SET idle_in_transaction_session_timeout = '30s';
 ```
 
-## 9. Paginate Large Collections
+## 11. Keep Transactions Short
+
+Never hold a DB transaction open across HTTP calls, sleeps, locks, or
+long computation. A stuck transaction pins a pool connection AND blocks
+every row it touched until it commits. Ten of them and the pool is dead.
+
+```python
+# WRONG — HTTP call inside a transaction
+async with db.begin():
+    user = await db.get(User, user_id)
+    data = await httpx_client.get("https://slow.example.com")  # 2s in txn
+    user.data = data.json()
+
+# CORRECT — read/compute first, transaction is just the write
+data = await httpx_client.get("https://slow.example.com")
+async with db.begin():
+    user = await db.get(User, user_id)
+    user.data = data.json()
+```
+
+Rules:
+- No network I/O inside a transaction
+- No waiting for a user / external response inside a transaction
+- `SELECT ... FOR UPDATE` must have a `lock_timeout` set
+- Long jobs (reports, imports) commit in batches, not one giant txn
+
+Watch Postgres's `pg_stat_activity.state = 'idle in transaction'` —
+anything there longer than a few seconds is a bug. The
+`idle_in_transaction_session_timeout` from §10 kills the leaks.
+
+## 12. Paginate Large Collections
 
 No endpoint should return an unbounded list. Pick one of:
 
@@ -203,7 +287,33 @@ Hard rules:
 - Default limit is small (20–50), not "all".
 - Internal batch jobs use batch sizes of 100–500, never "load all".
 
-## 10. Idempotent Writes (for retries)
+## 13. Bounded Payloads + Streaming
+
+Any endpoint that might return "a lot" must cap the response or stream it.
+
+Rules:
+- JSON list endpoints enforce `limit` (see §12) and compress with
+  gzip / brotli at the server or CDN
+- Exports > 10 MB → stream as NDJSON / CSV or hand out a signed S3 URL;
+  never buffer in memory
+- File downloads → chunked transfer, not full-read-then-send
+- Long AI / SSE responses → stream chunks as they arrive; first byte
+  should land in < 1s even if the full response takes 30s
+
+```python
+# Streaming CSV export — FastAPI
+async def stream_csv():
+    yield "id,name\n"
+    async for row in fetch_rows():
+        yield f"{row.id},{row.name}\n"
+
+return StreamingResponse(stream_csv(), media_type="text/csv")
+```
+
+Cap request bodies too. FastAPI / Express / Fastify all support max
+body size; default 1 MB, raise deliberately per upload endpoint.
+
+## 14. Idempotent Writes (for retries)
 
 Any write endpoint callable over a flaky network (mobile, webhooks,
 async retries) must be idempotent. Otherwise a retry after a
@@ -215,7 +325,7 @@ timed-out-but-successful request creates duplicates.
   `(user_id, order_id)` with a unique index.
 - Webhooks: include an event id; the consumer dedups on it.
 
-## 11. Database Indexes
+## 15. Database Indexes
 
 Every model needs indexes for:
 - Primary filter columns (status, type, is_active)
@@ -224,30 +334,30 @@ Every model needs indexes for:
 - Trigram indexes for fuzzy / ILIKE text search (Postgres: `gin_trgm_ops`)
 - JSONB containment for array-contains queries
 
-Run an EXPLAIN on every query in a hot path during code review. If the
+Run EXPLAIN on every query in a hot path during code review. If the
 plan shows a sequential scan on a table with > 10k rows, add the index
 before shipping.
 
-## 12. Connection Pool Sizing
+## 16. Connection Pool Sizing
 
 A pool too small starves the app under load; too large overwhelms the DB.
 
 **Formula** (applies to any language / ORM):
-- `pool_size  = num_workers * 2`
+- `pool_size    = num_workers * 2`
 - `max_overflow = pool_size / 2`
 - `pool_timeout = 30s` (max wait for a connection)
 - `pool_recycle = 300s` (refresh stale connections)
 - `pool_pre_ping = true` (verify liveness before use)
 
-For 10k concurrent users behind a typical worker setup, start at
-`pool_size=20, max_overflow=10`. Monitor `pool.checkedout()` at peak;
-if it sits at `pool_size + max_overflow`, raise the ceiling or add workers.
+For 10k concurrent users, start at `pool_size=20, max_overflow=10`.
+Monitor `pool.checkedout()` at peak; if it sits at
+`pool_size + max_overflow`, raise the ceiling or add workers.
 
 If the DB is behind a connection pooler (PgBouncer, Neon pooler), the
 **app's own pool should be smaller**, not larger — the pooler handles
 the fan-out. Always use the direct (non-pooled) URL for migrations.
 
-## 13. Rate Limiting Efficiency
+## 17. Rate Limiting Efficiency
 
 Rate limiting runs on every request. It must be cheap.
 
@@ -256,19 +366,43 @@ Rate limiting runs on every request. It must be cheap.
 - Use sliding-window counters only when accuracy matters; fixed-window
   buckets are almost always sufficient and cheaper
 
+## 18. Observability Baseline
+
+You can't fix what you can't see. Every service should emit at minimum:
+
+| Metric | Why | Alert when |
+|---|---|---|
+| Request latency p50 / p95 / p99 per endpoint | Find slow endpoints | p95 > SLO |
+| Error rate per endpoint (4xx separate from 5xx) | Catch regressions | 5xx rate > 0.5% |
+| DB query count per request | Detect N+1 early | > 20 queries/req |
+| Slow-query log (Postgres `log_min_duration_statement`) | Unindexed queries | threshold 500ms–1s |
+| Cache hit rate per key prefix | Wrong TTLs, cold caches | hit rate < target |
+| Pool usage (`checkedout / pool_size`) | Pool exhaustion | > 80% sustained |
+| Job queue depth + oldest-job age | Workers falling behind | depth > N or age > Ys |
+
+Export via OpenTelemetry → Prometheus / Datadog / Sentry / Grafana.
+Dashboard every metric above before launch; alert on the ones with a
+clear SLO. Log structured JSON with a `request_id` so traces are
+reconstructable across services.
+
 ## Production Readiness Checklist
 
 Before marking any endpoint as "done":
 
 - [ ] No sequential independent queries (parallel with gather / Promise.all)
-- [ ] No N+1 patterns (batch-fetch related data)
+- [ ] No N+1 read patterns (batch-fetch related data)
+- [ ] No N+1 write patterns (multi-row INSERT / COPY for bulk loads)
 - [ ] Heavy columns deferred (embeddings, large text / JSONB)
 - [ ] Stable data cached with appropriate TTL
 - [ ] Cache-Control header set
 - [ ] DB-side filtering (no full-table load + app-side filter)
 - [ ] Non-critical external calls are fire-and-forget
+- [ ] Must-succeed work runs in a background job, not the request
 - [ ] Timeouts on every external boundary (DB, HTTP, lock)
+- [ ] No network I/O inside a DB transaction
 - [ ] List endpoints paginate with a capped limit
+- [ ] Large responses stream, never buffer
 - [ ] Write endpoints support idempotent retry
 - [ ] Indexes exist for all filter / sort columns
 - [ ] Connection pool sized for expected concurrency
+- [ ] Latency / error-rate / query-count metrics emitted per endpoint
